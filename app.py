@@ -76,6 +76,9 @@ class AnimatedButton(tk.Button):
                 self._animate()
 
     def _animate(self):
+        if not self.winfo_exists():
+            self._animating = False
+            return
         self._animating = True
         r, g, b = self._current_color
         tr, tg, tb = self._target_color
@@ -108,15 +111,21 @@ class AnimatedButton(tk.Button):
 
 DEFAULT_KEYWORDS = "Live captions,字幕,caption"
 POLL_INTERVAL_MS = 700
+POLL_INTERVAL_S = POLL_INTERVAL_MS / 1000.0
 MIN_SEGMENT_DURATION_MS = 800
 SEGMENT_IDLE_MS = 2200
 MIN_TEXT_OVERLAP = 8
+UI_SEARCH_TIMEOUT_S = 3
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "LiveCaptionsRecorder" / "records"
 
 
-def format_srt_timestamp(dt: datetime) -> str:
-    """格式化 datetime 为 SRT 时间戳格式 (HH:MM:SS,mmm)"""
-    return dt.strftime("%H:%M:%S,%f")[:-3]
+def format_srt_timestamp(delta: timedelta) -> str:
+    """格式化 timedelta 为 SRT 时间戳格式 (HH:MM:SS,mmm)，表示相对于字幕起点的偏移量。"""
+    total_ms = int(delta.total_seconds() * 1000)
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, ms = divmod(remainder, 1_000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{ms:03}"
 
 
 @dataclass
@@ -167,12 +176,17 @@ class SessionExporter:
                 handle.write(f"[{segment.start_text} -> {segment.end_text}] {segment.text}\n")
         files_created.append(txt_path)
 
-        # 2. 儲存 SRT
+        # 2. 儲存 SRT（时间戳为相对于第一条字幕起点的偏移量）
         srt_path = self.output_dir / f"captions_{stamp}.srt"
+        origin = segments[0].start_at
         with srt_path.open("w", encoding="utf-8") as handle:
             for i, segment in enumerate(segments, 1):
                 handle.write(f"{i}\n")
-                handle.write(f"{format_srt_timestamp(segment.start_at)} --> {format_srt_timestamp(segment.end_at)}\n")
+                handle.write(
+                    f"{format_srt_timestamp(segment.start_at - origin)}"
+                    f" --> "
+                    f"{format_srt_timestamp(segment.end_at - origin)}\n"
+                )
                 handle.write(f"{segment.text}\n\n")
         files_created.append(srt_path)
 
@@ -344,8 +358,7 @@ class TranscriptBuilder:
     def _should_merge(self, previous_change_at: datetime | None, captured_at: datetime) -> bool:
         if previous_change_at is None:
             return False
-        idle_ms = (captured_at - previous_change_at).total_seconds() * 1000
-        return idle_ms <= SEGMENT_IDLE_MS
+        return (captured_at - previous_change_at) <= timedelta(milliseconds=SEGMENT_IDLE_MS)
 
     def _extract_increment(self, current_snapshot: str) -> str:
         previous = self.previous_snapshot
@@ -358,7 +371,10 @@ class TranscriptBuilder:
         overlap = self._suffix_prefix_overlap(previous, current_snapshot)
         if overlap >= MIN_TEXT_OVERLAP:
             return current_snapshot[overlap:].strip()
-        return ""
+
+        # 字幕窗口发生了完全刷新（例如段落滚动、语言切换），没有任何重叠内容。
+        # 此时将整个新快照作为增量，避免丢失字幕内容。
+        return current_snapshot
 
     def _suffix_prefix_overlap(self, previous: str, current: str) -> int:
         max_size = min(len(previous), len(current))
@@ -477,13 +493,13 @@ class RecorderWorker:
                         if not missing_window_reported:
                             self.message_queue.put(("status", "未找到字幕窗口，正在重试"))
                             missing_window_reported = True
-                        time.sleep(POLL_INTERVAL_MS / 1000)
+                        time.sleep(POLL_INTERVAL_S)
                         continue
 
                     missing_window_reported = False
                     raw_text = self.extractor.extract_text(window)
                     if not raw_text:
-                        time.sleep(POLL_INTERVAL_MS / 1000)
+                        time.sleep(POLL_INTERVAL_S)
                         continue
 
                     active = self.builder.update(
@@ -518,7 +534,7 @@ class RecorderWorker:
                         self.message_queue.put(("status", message))
                         last_error = message
 
-                time.sleep(POLL_INTERVAL_MS / 1000)
+                time.sleep(POLL_INTERVAL_S)
                 
         finished_at = datetime.now()
         segments = self.builder.finish(finished_at)
@@ -551,10 +567,10 @@ class App:
         self._load_config()
 
         self.finder = LiveCaptionsFinder(self._current_keywords())
-        self.extractor = CaptionExtractor()
         self.recorder = RecorderWorker(self.finder, self.messages)
 
         self.toggle_button: tk.Button | None = None
+        self._closing = False
 
         self._build_ui()
         self._set_recording_state(False)
@@ -664,8 +680,7 @@ class App:
 
     def open_live_captions(self) -> None:
         try:
-            # 尝试直接启动 Live Captions
-            subprocess.Popen("start livecaptions.exe", shell=True)
+            subprocess.Popen(["cmd", "/c", "start", "livecaptions.exe"])
             self.status_var.set("正在尝试打开 Windows 内建字幕...")
             self._append_log("正在尝试打开 Windows 内建字幕")
         except Exception as exc:  # noqa: BLE001
@@ -729,7 +744,7 @@ class App:
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = output_dir / f"control_tree_{stamp}.txt"
-        path.write_text(self.extractor.dump_control_tree(window), encoding="utf-8")
+        path.write_text(self.recorder.extractor.dump_control_tree(window), encoding="utf-8")
         self.status_var.set(f"已导出控件树：{path.name}")
         self._append_log(f"已导出控件树：{path}")
 
@@ -749,17 +764,25 @@ class App:
                 self._set_recording_state(False)
                 if self.toggle_button:
                     self.toggle_button.configure(state=tk.NORMAL)
+                if self._closing:
+                    self.root.destroy()
+                    return
         self.root.after(200, self._drain_messages)
 
     def on_close(self) -> None:
-        if self.recorder.running:
-            self.recorder.stop()
         self._save_config()
-        self.root.destroy()
+        if self.recorder.running:
+            # 等待后台线程完成文件保存后再销毁窗口，防止守护线程被强制终止
+            self._closing = True
+            self.recorder.stop()
+            if self.toggle_button:
+                self.toggle_button.configure(text="正在停止...", state=tk.DISABLED)
+        else:
+            self.root.destroy()
 
 
 def main() -> None:
-    auto.SetGlobalSearchTimeout(3)
+    auto.SetGlobalSearchTimeout(UI_SEARCH_TIMEOUT_S)
     root = tk.Tk()
     style = ttk.Style()
     if "vista" in style.theme_names():
