@@ -1,0 +1,3 @@
+uiautomation==2.0.29
+pywin32==311
+pyinstaller==6.19.0

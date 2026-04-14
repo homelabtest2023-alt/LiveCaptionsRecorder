@@ -1,0 +1,23 @@
+# 忽略 Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略打包生成的目录和文件
+build/
+dist*/
+*.spec
+*.pkg
+*.toc
+*.zip
+
+# 忽略本地运行产生的日志与记录数据
+@AutomationLog.txt
+records/
+records_test/
+config.json
+
+# 忽略虚拟环境
+venv/
+env/
+.env
