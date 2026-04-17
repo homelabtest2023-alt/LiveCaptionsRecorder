@@ -56,6 +56,10 @@ python app.py
 ```
 构建结果将输出在 `dist_v5/LiveCaptionsRecorder/` 目录下。
 
+## 🆕 最近更新
+
+- 2026-04-17: 同步更新 — 已将本地对 app.py 的更改提交并推送到 GitHub；增强了录制稳定性与导出格式兼容性（详见 commit）。
+
 ## 📄 许可协议
 
 本项目采用 [MIT License](LICENSE) 许可协议。欢迎反馈与提交 PR！

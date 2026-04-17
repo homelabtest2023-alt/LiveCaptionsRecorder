@@ -12,7 +12,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TextIO
 
 import pythoncom
 import uiautomation as auto
@@ -149,48 +149,63 @@ def ensure_min_duration(start_at: datetime, end_at: datetime) -> datetime:
 
 
 class SessionExporter:
+    """流式写入导出器：每条字幕完成后立即落盘，防止长会议崩溃丢失数据。"""
+
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._stamp = ""
+        self._txt_handle: TextIO | None = None
+        self._srt_handle: TextIO | None = None
+        self._jsonl_handle: TextIO | None = None
+        self._srt_index = 0
 
-    def save(self, segments: list[TranscriptSegment], finished_at: datetime) -> list[Path]:
-        if not segments:
-            return []
+    def open(self, started_at: datetime) -> None:
+        self._stamp = started_at.strftime("%Y%m%d_%H%M%S")
+        self._txt_handle = (self.output_dir / f"captions_{self._stamp}.txt").open("w", encoding="utf-8")
+        self._srt_handle = (self.output_dir / f"captions_{self._stamp}.srt").open("w", encoding="utf-8")
+        self._jsonl_handle = (self.output_dir / f"captions_{self._stamp}.jsonl").open("w", encoding="utf-8")
+        self._srt_index = 0
 
-        stamp = finished_at.strftime("%Y%m%d_%H%M%S")
-        files_created = []
+    def write(self, segment: TranscriptSegment) -> None:
+        if self._txt_handle:
+            self._txt_handle.write(f"[{segment.start_text} -> {segment.end_text}] {segment.text}\n")
+            self._txt_handle.flush()
+        if self._srt_handle:
+            self._srt_index += 1
+            self._srt_handle.write(f"{self._srt_index}\n")
+            self._srt_handle.write(f"{format_srt_timestamp(segment.start_at)} --> {format_srt_timestamp(segment.end_at)}\n")
+            self._srt_handle.write(f"{segment.text}\n\n")
+            self._srt_handle.flush()
+        if self._jsonl_handle:
+            self._jsonl_handle.write(json.dumps(segment.to_dict(), ensure_ascii=False) + "\n")
+            self._jsonl_handle.flush()
 
-        # 1. 儲存 TXT
-        txt_path = self.output_dir / f"captions_{stamp}.txt"
-        with txt_path.open("w", encoding="utf-8") as handle:
-            for segment in segments:
-                handle.write(f"[{segment.start_text} -> {segment.end_text}] {segment.text}\n")
-        files_created.append(txt_path)
-
-        # 2. 儲存 SRT
-        srt_path = self.output_dir / f"captions_{stamp}.srt"
-        with srt_path.open("w", encoding="utf-8") as handle:
-            for i, segment in enumerate(segments, 1):
-                handle.write(f"{i}\n")
-                handle.write(f"{format_srt_timestamp(segment.start_at)} --> {format_srt_timestamp(segment.end_at)}\n")
-                handle.write(f"{segment.text}\n\n")
-        files_created.append(srt_path)
-
-        # 3. 儲存 JSONL
-        jsonl_path = self.output_dir / f"captions_{stamp}.jsonl"
-        with jsonl_path.open("w", encoding="utf-8") as handle:
-            for segment in segments:
-                handle.write(json.dumps(segment.to_dict(), ensure_ascii=False) + "\n")
-        files_created.append(jsonl_path)
-
-        return files_created
+    def close(self) -> list[Path]:
+        files: list[Path] = []
+        for handle, ext in [
+            (self._txt_handle, "txt"),
+            (self._srt_handle, "srt"),
+            (self._jsonl_handle, "jsonl"),
+        ]:
+            if handle:
+                handle.close()
+                path = self.output_dir / f"captions_{self._stamp}.{ext}"
+                if self._srt_index > 0:
+                    files.append(path)
+                else:
+                    path.unlink(missing_ok=True)
+        self._txt_handle = self._srt_handle = self._jsonl_handle = None
+        return files
 
 
 class CaptionExtractor:
     _SPACES_RE = re.compile(r"\s+")
+    _CACHE_REFRESH_POLLS = 300  # 每 ~3.5 分钟强制重新扫描一次，应对 Live Captions 重启
 
     def __init__(self) -> None:
         self._cached_control: auto.Control | None = None
+        self._poll_count = 0
 
     @classmethod
     def normalize_text(cls, text: str) -> str:
@@ -214,6 +229,12 @@ class CaptionExtractor:
                 stack.append((child, depth + 1))
 
     def extract_text(self, window: auto.Control) -> str:
+        # 定期清除缓存，防止超长会议中 Live Captions 重启后失效
+        self._poll_count += 1
+        if self._poll_count >= self._CACHE_REFRESH_POLLS:
+            self._cached_control = None
+            self._poll_count = 0
+
         # 1. 尝试使用缓存的控件
         if self._cached_control:
             try:
@@ -260,8 +281,8 @@ class CaptionExtractor:
         # 排序并取优先级最高且长度最长的控件作为主字幕源
         matches.sort(key=lambda item: (item[0], -len(item[1])))
         self._cached_control = matches[0][2]
-        
-        return "\n".join(text for _, text, _ in matches).strip()
+        # 始终只返回最优控件的文本，与缓存命中时行为一致，保证增量提取的正确性
+        return matches[0][1]
 
     def dump_control_tree(self, window: auto.Control, max_depth: int = 10) -> str:
         lines: list[str] = []
@@ -289,12 +310,21 @@ class CaptionExtractor:
 
 
 class TranscriptBuilder:
+    MAX_DISPLAY_SEGMENTS = 20  # 内存中最多保留的已完成字幕条数（旧的已落盘）
+
     def __init__(self) -> None:
         self.snapshot_initialized = False
         self.previous_snapshot = ""
         self.active_segment: TranscriptSegment | None = None
         self.last_change_at: datetime | None = None
         self.completed_segments: list[TranscriptSegment] = []
+        self._new_segments: list[TranscriptSegment] = []  # 待落盘的新完成字幕
+
+    def drain_new_segments(self) -> list[TranscriptSegment]:
+        """取出并清空待落盘队列，供调用方写入磁盘。"""
+        result = self._new_segments
+        self._new_segments = []
+        return result
 
     def update(self, raw_text: str, captured_at: datetime, window_name: str) -> TranscriptSegment | None:
         raw_text = CaptionExtractor.normalize_text(raw_text)
@@ -391,6 +421,10 @@ class TranscriptBuilder:
                 self.completed_segments[-1].end_at = self.active_segment.end_at
             else:
                 self.completed_segments.append(self.active_segment)
+                self._new_segments.append(self.active_segment)
+                # 超出显示缓冲区的旧条目已落盘，可从内存中移除
+                if len(self.completed_segments) > self.MAX_DISPLAY_SEGMENTS:
+                    del self.completed_segments[:-self.MAX_DISPLAY_SEGMENTS]
 
         self.active_segment = None
         self.last_change_at = None
@@ -438,6 +472,7 @@ class RecorderWorker:
         self._thread: threading.Thread | None = None
         self._output_dir: Path | None = None
         self._segment_count = 0
+        self._total_segment_count = 0  # 跨内存裁剪的累计已保存条数
         self.session_started_at: datetime | None = None
 
     @property
@@ -452,12 +487,14 @@ class RecorderWorker:
         self.exporter = SessionExporter(output_dir)
         self._output_dir = output_dir
         self._segment_count = 0
+        self._total_segment_count = 0
         self.session_started_at = datetime.now()
+        self.exporter.open(self.session_started_at)  # 立即建立文件，之后增量写入
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self.message_queue.put(("status", f"开始新会话：{self.session_started_at.strftime('%Y-%m-%d %H:%M:%S')}"))
         self.message_queue.put(("status", "已建立基线，开始后不会记录开始前已经存在的旧字幕"))
-        self.message_queue.put(("status", f"停止后会保存到：{output_dir}"))
+        self.message_queue.put(("status", f"实时保存到：{output_dir}"))
 
     def stop(self) -> None:
         if not self.running:
@@ -491,6 +528,13 @@ class RecorderWorker:
                         captured_at=datetime.now(),
                         window_name=(window.Name or "").strip(),
                     )
+
+                    # 每条字幕完成后立即落盘，不等待会话结束
+                    for seg in self.builder.drain_new_segments():
+                        if self.exporter:
+                            self.exporter.write(seg)
+                        self._total_segment_count += 1
+
                     if active is not None:
                         display_lines = []
                         # 显示最近的 2 条已完成字幕
@@ -500,16 +544,14 @@ class RecorderWorker:
                         
                         # 显示当前正在识别的实时字幕
                         active_time = active.start_at.strftime('%H:%M:%S')
-                        # 如果文本过长，截取最后几行防止撑爆界面
                         lines = active.text.split("\n")
                         active_text_display = "\n".join(lines[-3:]) if len(lines) > 3 else active.text
                         display_lines.append(f"[{active_time} 实时...] {active_text_display}")
 
                         self.message_queue.put(("caption", "\n".join(display_lines)))
 
-                        new_count = len(self.builder.completed_segments)
-                        if new_count != self._segment_count:
-                            self._segment_count = new_count
+                        if self._total_segment_count != self._segment_count:
+                            self._segment_count = self._total_segment_count
                             self.message_queue.put(("status", f"已整理 {self._segment_count} 条字幕"))
                         last_error = ""
                 except Exception as exc:  # noqa: BLE001
@@ -519,16 +561,22 @@ class RecorderWorker:
                         last_error = message
 
                 time.sleep(POLL_INTERVAL_MS / 1000)
-                
+
+        # 收尾：将最后一段活跃字幕落盘
         finished_at = datetime.now()
-        segments = self.builder.finish(finished_at)
+        self.builder.finish(finished_at)
+        for seg in self.builder.drain_new_segments():
+            if self.exporter:
+                self.exporter.write(seg)
+            self._total_segment_count += 1
+
         files: list[Path] = []
         if self.exporter is not None:
-            files = self.exporter.save(segments, finished_at)
+            files = self.exporter.close()
 
         if files:
             saved_names = " / ".join(path.name for path in files)
-            self.message_queue.put(("status", f"已保存 {len(segments)} 条字幕：{saved_names}"))
+            self.message_queue.put(("status", f"已保存 {self._total_segment_count} 条字幕：{saved_names}"))
         else:
             self.message_queue.put(("status", "本次没有可保存的字幕内容"))
             
@@ -555,6 +603,7 @@ class App:
         self.recorder = RecorderWorker(self.finder, self.messages)
 
         self.toggle_button: tk.Button | None = None
+        self._close_deadline: float = 0.0
 
         self._build_ui()
         self._set_recording_state(False)
@@ -664,8 +713,7 @@ class App:
 
     def open_live_captions(self) -> None:
         try:
-            # 尝试直接启动 Live Captions
-            subprocess.Popen("start livecaptions.exe", shell=True)
+            subprocess.Popen(["cmd", "/c", "start", "", "livecaptions.exe"])
             self.status_var.set("正在尝试打开 Windows 内建字幕...")
             self._append_log("正在尝试打开 Windows 内建字幕")
         except Exception as exc:  # noqa: BLE001
@@ -677,6 +725,10 @@ class App:
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} {text}\n")
+        # 超长会议日志裁剪：超过 1200 行时删除最旧的 200 行，保留约 1000 行
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > 1200:
+            self.log_text.delete("1.0", "201.0")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
@@ -754,8 +806,18 @@ class App:
     def on_close(self) -> None:
         if self.recorder.running:
             self.recorder.stop()
-        self._save_config()
-        self.root.destroy()
+            self._close_deadline = time.monotonic() + 15  # 最多等待 15 秒存盘
+            self.root.after(200, self._wait_and_close)
+        else:
+            self._save_config()
+            self.root.destroy()
+
+    def _wait_and_close(self) -> None:
+        if self.recorder.running and time.monotonic() < self._close_deadline:
+            self.root.after(200, self._wait_and_close)
+        else:
+            self._save_config()
+            self.root.destroy()
 
 
 def main() -> None:
